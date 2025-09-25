@@ -1,0 +1,922 @@
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local MAX_UNDERGROUND_OFFSET = 10
+local MIN_UNDERGROUND_OFFSET = 0
+local TELEPORT_NEAR_TREE_OFFSET = 25
+local HORIZONTAL_DISTANCE_THRESHOLD = 10000
+local SELL_WORLD_ID = 3475397644
+local FARM_WORLD_ID = 125804922932357
+local farmStartTime = tick()
+local lastSafePosition = Vector3.new(0, 100, 0)
+
+-- 🖥️ Toggle 3D Rendering
+local renderingEnabled = true
+
+local function setRenderingEnabled(enabled)
+    renderingEnabled = enabled
+    game:GetService("RunService"):Set3dRenderingEnabled(enabled)
+    if enabled then
+        print("🎨 3D Rendering: ENABLED")
+    else
+        print("🚫 3D Rendering: DISABLED (Performance Mode)")
+    end
+end
+
+-- เปิด Rendering เป็นค่าเริ่มต้น
+setRenderingEnabled(true)
+
+pcall(function()
+    local mobRemote = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    if mobRemote then
+        local target = mobRemote:FindFirstChild("MobDamageRemote")
+        if target then
+            target:Destroy()
+            print("")
+        end
+    end
+end)
+
+-- ✅ วาร์ปไป FARM_WORLD_ID ทันที
+task.spawn(function()
+    task.wait(2)
+    local remoteTeleport = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("WorldTeleportRemote")
+
+    if game.PlaceId ~= FARM_WORLD_ID then
+        print("🛫 วาร์ปไปโลกฟาร์ม...")
+        local args = { FARM_WORLD_ID, {} }
+        remoteTeleport:InvokeServer(unpack(args))
+    else
+        print("✅ อยู่ในโลกฟาร์มแล้ว")
+    end
+end)
+
+local watchedItems = {
+   "EdamameFoodModel","KajiFruitFoodModel","MistSudachiFoodModel"
+}
+
+local targetNames = {
+   "AppleFoodModel", "LemonFoodModel", "CornFoodModel", "CarrotFoodModel", "PearFoodModel",
+    "StrawberryFoodModel", "PeachFoodModel", "PotatoFoodModel", "BroccoliFoodModel", "CherryFoodModel",
+    "BuleberryFoodModel", "MushroomFoodModel", "BananaFoodModel", "AlmondFoodModel", "OnionFoodModel",
+    "KelpFoodModel", "GrapesFoodModel", "WatermelonFoodModel", "PricklyPearFoodModel", "ChiliFoodModel",
+    "GlowingMushroomFoodModel", "PineappleFoodModel", "CottonCandyFoodModel", "JuniperBerryFoodModel",
+    "LimeFoodModel", "DragonfruitFoodModel", "AvacadoFoodModel", "CacaoBeanFoodModel", "CoconutFoodModel","EdamameFoodModel","KajiFruitFoodModel","MistSudachiFoodModel"
+}
+
+local isFarming = true -- 🟢 เริ่มฟาร์มทันที
+
+-- 🗺️ ตำแหน่งเช็คพื้นที่ ถ้าไม่เจอต้นไม้ให้วาร์ปไปตามนี้
+local checkPositions = {
+    Vector3.new(-266, 467, -394),
+    Vector3.new(1757, 783, 672),
+    Vector3.new(1420, 319, -1409),
+    Vector3.new(1922, 620, -2566),
+    Vector3.new(2226, 585, -4128),
+    Vector3.new(330, 901, -4304),
+    Vector3.new(-1433, 779, -4717),
+    Vector3.new(-3031, 780, -4211),
+    Vector3.new(-2643, 547, -2250),
+    Vector3.new(-857, 401, -2132),
+    Vector3.new(-828, 688, -3444),
+	Vector3.new(-1819, 405, 170),
+	Vector3.new(-1523, 962, 1150)
+}
+
+local currentCheckIndex = 1
+
+-- 🟢 ฟังก์ชันตรวจสอบว่าสคริปต์ทำงานหรือยัง
+local scriptRunning = false   -- ค่าตั้งต้น = ยังไม่ทำงาน
+
+local function isScriptWorking()
+    -- 🛠️ ใส่เงื่อนไขตรวจสอบว่าฟีเจอร์หลักของคุณรันแล้วหรือยัง
+    -- เช่น ตรวจว่า GUI ถูกสร้างแล้ว หรือข้อมูลจากเกมโหลดแล้ว
+    return _G.FarmItemLabels ~= nil and next(_G.FarmItemLabels) ~= nil
+end
+
+local function ensureScriptRunning()
+    task.spawn(function()
+        while not scriptRunning do
+            print("⏳ กำลังตรวจสอบว่าสคริปต์รันสำเร็จหรือยัง...")
+
+            if isScriptWorking() then
+                scriptRunning = true
+                print("✅ สคริปต์รันสำเร็จแล้ว!")
+            else
+                print("⚠️ สคริปต์ยังไม่รัน → พยายามรันซ้ำ")
+                pcall(function()
+                    createCombinedUI() -- เรียกสร้าง UI อีกรอบ
+                end)
+            end
+
+            task.wait(2) -- รอตรวจสอบใหม่ทุก 2 วินาที
+        end
+    end)
+end
+
+-- 📱 ตรวจสอบว่าเป็นมือถือหรือไม่
+local function isMobile()
+    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+end
+
+-- 📱 คำนวณ Scale ขึ้นอยู่กับขนาดหน้าจอ
+local function getScreenScale()
+    local viewport = workspace.CurrentCamera.ViewportSize
+    local baseWidth = 1920  -- ขนาดหน้าจอฐาน (Desktop)
+    local scale = math.min(viewport.X / baseWidth, 1) -- ไม่ให้ใหญ่เกิน 100%
+    
+    -- มือถือให้ scale ใหญ่ขึ้นเล็กน้อย
+    if isMobile() then
+        scale = math.max(scale * 1.2, 0.7) -- อย่างน้อย 70%
+    end
+    
+    return math.clamp(scale, 0.5, 1.5) -- จำกัดระหว่าง 50%-150%
+end
+
+local function createCombinedUI()
+	local screenGui = Instance.new("ScreenGui", LocalPlayer:WaitForChild("PlayerGui"))
+	screenGui.Name = "NEXON_UI"
+	screenGui.ResetOnSpawn = false
+
+    -- 📱 คำนวณ Scale และ Layout
+    local scale = getScreenScale()
+    local mobile = isMobile()
+    local viewport = workspace.CurrentCamera.ViewportSize
+    
+    print("📱 Device:", mobile and "Mobile" or "Desktop", "| Scale:", scale, "| Viewport:", viewport.X.."x"..viewport.Y)
+
+	-- Main Container (ปรับให้เหมาะกับแต่ละอุปกรณ์)
+	local mainFrame = Instance.new("Frame", screenGui)
+	mainFrame.BackgroundColor3 = Color3.fromRGB(10, 15, 25)
+	mainFrame.BackgroundTransparency = 0.05
+	mainFrame.BorderSizePixel = 0
+	mainFrame.Name = "MainPanel"
+    
+    -- 📱 ปรับขนาดตามอุปกรณ์
+    if mobile then
+        -- มือถือ: เต็มหน้าจอ แต่เว้นขอบเล็กน้อย
+        mainFrame.Size = UDim2.new(0.98, 0, 0.95, 0)
+        mainFrame.Position = UDim2.new(0.01, 0, 0.025, 0)
+    else
+        -- เดสก์ท็อป: ขนาดพอดี ไม่เต็มจอ
+        mainFrame.Size = UDim2.new(0.85, 0, 0.9, 0)
+        mainFrame.Position = UDim2.new(0.075, 0, 0.05, 0)
+    end
+    
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, mobile and 15 or 20)
+    mainCorner.Parent = mainFrame
+
+	-- Title Bar (ปรับความสูงตามอุปกรณ์)
+	local titleBar = Instance.new("Frame", mainFrame)
+	titleBar.BackgroundColor3 = Color3.fromRGB(30, 45, 65)
+	titleBar.Size = UDim2.new(1, 0, 0, mobile and 70 or 100)
+	titleBar.Position = UDim2.new(0, 0, 0, 0)
+	titleBar.BorderSizePixel = 0
+
+	local titleCorner = Instance.new("UICorner")
+	titleCorner.CornerRadius = UDim.new(0, mobile and 15 or 20)
+	titleCorner.Parent = titleBar
+
+	local titleStroke = Instance.new("UIStroke")
+	titleStroke.Color = Color3.fromRGB(0, 255, 255)
+	titleStroke.Thickness = mobile and 2 or 4
+	titleStroke.Parent = titleBar
+
+	-- Title Text (ปรับขนาดตามหน้าจอ)
+	local title = Instance.new("TextLabel", titleBar)
+	title.Position = UDim2.new(0, mobile and 20 or 300, 0, 0)
+	title.Size = UDim2.new(mobile and 0.6 or 0.7, 0, 1, 0)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.Gotham
+	title.Text = mobile and "NEXON AFK" or "NEXON SCRIPT AFK COINS"
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.TextScaled = true -- ปรับขนาดตัวอักษรอัตโนมัติ
+	title.TextSize = mobile and 25 or 25
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextStrokeTransparency = 0.7
+	title.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+
+	-- Coins Display (ปรับขนาดและตำแหน่ง)
+	local coinsFrame = Instance.new("Frame", mainFrame)
+	local titleHeight = mobile and 70 or 100
+    local padding = mobile and 10 or 20
+    
+	coinsFrame.Position = UDim2.new(0, padding, 0, titleHeight + padding)
+	coinsFrame.Size = UDim2.new(1, -padding*2, 0, mobile and 80 or 120)
+	coinsFrame.BackgroundColor3 = Color3.fromRGB(255, 215, 0)
+	coinsFrame.BorderSizePixel = 0
+
+	local coinsCorner = Instance.new("UICorner")
+	coinsCorner.CornerRadius = UDim.new(0, mobile and 15 or 25)
+	coinsCorner.Parent = coinsFrame
+
+	local coinsStroke = Instance.new("UIStroke")
+	coinsStroke.Color = Color3.fromRGB(255, 140, 0)
+	coinsStroke.Thickness = mobile and 3 or 6
+	coinsStroke.Parent = coinsFrame
+
+	local coinsIcon = Instance.new("TextLabel", coinsFrame)
+	coinsIcon.Position = UDim2.new(0, mobile and 15 or 30, 0, 0)
+	coinsIcon.Size = UDim2.new(0, mobile and 60 or 120, 1, 0)
+	coinsIcon.BackgroundTransparency = 1
+	coinsIcon.Font = Enum.Font.GothamBlack
+	coinsIcon.Text = "💰"
+	coinsIcon.TextColor3 = Color3.fromRGB(0, 0, 0)
+	coinsIcon.TextScaled = true
+	coinsIcon.TextSize = mobile and 35 or 60
+	coinsIcon.TextYAlignment = Enum.TextYAlignment.Center
+
+	local coinsLabel = Instance.new("TextLabel", coinsFrame)
+	coinsLabel.Position = UDim2.new(0, mobile and 85 or 150, 0, 0)
+	coinsLabel.Size = UDim2.new(1, mobile and -100 or -150, 1, 0)
+	coinsLabel.BackgroundTransparency = 1
+	coinsLabel.Font = Enum.Font.GothamBlack
+	coinsLabel.Text = "COINS: Loading..."
+	coinsLabel.TextColor3 = Color3.fromRGB(0, 0, 0)
+	coinsLabel.TextScaled = true
+	coinsLabel.TextSize = mobile and 24 or 42
+	coinsLabel.TextXAlignment = Enum.TextXAlignment.Left
+	coinsLabel.TextYAlignment = Enum.TextYAlignment.Center
+	coinsLabel.TextStrokeTransparency = 0.7
+	coinsLabel.TextStrokeColor3 = Color3.fromRGB(255, 255, 255)
+
+	-- Items Container (ปรับเป็น ScrollingFrame สำหรับมือถือ)
+	local itemsFrame = Instance.new("Frame", mainFrame)
+	local coinsBottom = titleHeight + (mobile and 80 or 120) + padding*2
+    
+	itemsFrame.Position = UDim2.new(0, padding, 0, coinsBottom + padding)
+	itemsFrame.Size = UDim2.new(1, -padding*2, 0, mobile and 200 or 300)
+	itemsFrame.BackgroundColor3 = Color3.fromRGB(25, 35, 50)
+	itemsFrame.BorderSizePixel = 0
+
+	local itemsCorner = Instance.new("UICorner")
+	itemsCorner.CornerRadius = UDim.new(0, mobile and 15 or 20)
+	itemsCorner.Parent = itemsFrame
+
+	local itemsStroke = Instance.new("UIStroke")
+	itemsStroke.Color = Color3.fromRGB(0, 200, 255)
+	itemsStroke.Thickness = mobile and 2 or 4
+	itemsStroke.Parent = itemsFrame
+
+	local itemsTitle = Instance.new("TextLabel", itemsFrame)
+	itemsTitle.Position = UDim2.new(0, 0, 0, 0)
+	itemsTitle.Size = UDim2.new(1, 0, 0, mobile and 40 or 60)
+	itemsTitle.BackgroundTransparency = 1
+	itemsTitle.Font = Enum.Font.GothamBlack
+	itemsTitle.Text = "📦 World Shinrin"
+	itemsTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+	itemsTitle.TextScaled = true
+	itemsTitle.TextSize = mobile and 20 or 32
+	itemsTitle.TextStrokeTransparency = 0.5
+	itemsTitle.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+
+    -- ScrollingFrame สำหรับ Items (มือถือจะใช้ scroll ได้)
+	local itemsContainer
+    if mobile then
+        itemsContainer = Instance.new("ScrollingFrame", itemsFrame)
+        itemsContainer.Position = UDim2.new(0, 10, 0, 50)
+        itemsContainer.Size = UDim2.new(1, -20, 1, -60)
+        itemsContainer.BackgroundTransparency = 1
+        itemsContainer.ScrollBarThickness = 8
+        itemsContainer.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+        itemsContainer.CanvasSize = UDim2.new(0, 0, 0, 0) -- จะปรับเองตาม UIListLayout
+    else
+        itemsContainer = Instance.new("Frame", itemsFrame)
+        itemsContainer.Position = UDim2.new(0, 30, 0, 70)
+        itemsContainer.Size = UDim2.new(1, -60, 1, -80)
+        itemsContainer.BackgroundTransparency = 1
+    end
+
+	local itemsLayout = Instance.new("UIListLayout", itemsContainer)
+    if mobile then
+        -- มือถือ: เรียงแนวตั้ง 1 คอลัมน์
+        itemsLayout.FillDirection = Enum.FillDirection.Vertical
+        itemsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        itemsLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+        itemsLayout.Padding = UDim.new(0, 15)
+    else
+        -- เดสก์ท็อป: เรียงแนวนอน
+        itemsLayout.FillDirection = Enum.FillDirection.Horizontal
+        itemsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+        itemsLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+        itemsLayout.Padding = UDim.new(0, 20)
+    end
+
+	_G.FarmItemLabels = {}
+
+	for _, name in ipairs(watchedItems) do
+		local itemName = name:gsub("FoodModel", "")
+
+		local itemBox = Instance.new("Frame", itemsContainer)
+        if mobile then
+            itemBox.Size = UDim2.new(0.9, 0, 0, 120)
+        else
+            itemBox.Size = UDim2.new(0, 280, 0, 200)
+        end
+		itemBox.BackgroundColor3 = Color3.fromRGB(40, 55, 75)
+		itemBox.BorderSizePixel = 0
+
+		local itemBoxCorner = Instance.new("UICorner")
+		itemBoxCorner.CornerRadius = UDim.new(0, mobile and 10 or 15)
+		itemBoxCorner.Parent = itemBox
+
+		local itemBoxStroke = Instance.new("UIStroke")
+		itemBoxStroke.Color = Color3.fromRGB(100, 255, 150)
+		itemBoxStroke.Thickness = mobile and 2 or 3
+		itemBoxStroke.Parent = itemBox
+
+		local itemLabel = Instance.new("TextLabel", itemBox)
+        if mobile then
+            itemLabel.Position = UDim2.new(0, 0, 0, 5)
+            itemLabel.Size = UDim2.new(0.6, 0, 1, -10)
+        else
+            itemLabel.Position = UDim2.new(0, 0, 0, 10)
+            itemLabel.Size = UDim2.new(1, 0, 0.4, 0)
+        end
+		itemLabel.BackgroundTransparency = 1
+		itemLabel.Font = Enum.Font.GothamBlack
+		itemLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+		itemLabel.TextScaled = true
+        itemLabel.TextSize = mobile and 16 or 24
+		itemLabel.Text = itemName
+		itemLabel.TextYAlignment = Enum.TextYAlignment.Center
+        itemLabel.TextXAlignment = mobile and Enum.TextXAlignment.Left or Enum.TextXAlignment.Center
+		itemLabel.TextStrokeTransparency = 0.5
+		itemLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+
+		local itemCount = Instance.new("TextLabel", itemBox)
+        if mobile then
+            itemCount.Position = UDim2.new(0.6, 0, 0, 5)
+            itemCount.Size = UDim2.new(0.4, -5, 1, -10)
+        else
+            itemCount.Position = UDim2.new(0, 0, 0.4, 0)
+            itemCount.Size = UDim2.new(1, 0, 0.6, 0)
+        end
+		itemCount.BackgroundTransparency = 1
+		itemCount.Font = Enum.Font.GothamBlack
+		itemCount.TextColor3 = Color3.fromRGB(0, 255, 127)
+        itemCount.TextScaled = true
+		itemCount.TextSize = mobile and 24 or 48
+		itemCount.Text = "0"
+		itemCount.TextYAlignment = Enum.TextYAlignment.Center
+        itemCount.TextXAlignment = mobile and Enum.TextXAlignment.Right or Enum.TextXAlignment.Center
+		itemCount.TextStrokeTransparency = 0.3
+		itemCount.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+
+		_G.FarmItemLabels[itemName] = itemCount
+	end
+    
+    -- ปรับ CanvasSize สำหรับ ScrollingFrame (มือถือ)
+    if mobile then
+        itemsLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+            itemsContainer.CanvasSize = UDim2.new(0, 0, 0, itemsLayout.AbsoluteContentSize.Y)
+        end)
+    end
+
+	-- Time and Status Container
+	local statusFrame = Instance.new("Frame", mainFrame)
+    local itemsBottom = coinsBottom + (mobile and 200 or 300) + padding*2
+    
+	statusFrame.Position = UDim2.new(0, padding, 0, itemsBottom + padding)
+	statusFrame.Size = UDim2.new(1, -padding*2, 0, mobile and 60 or 100)
+	statusFrame.BackgroundColor3 = Color3.fromRGB(25, 35, 50)
+	statusFrame.BorderSizePixel = 0
+
+	local statusCorner = Instance.new("UICorner")
+	statusCorner.CornerRadius = UDim.new(0, mobile and 15 or 20)
+	statusCorner.Parent = statusFrame
+
+	local statusStroke = Instance.new("UIStroke")
+	statusStroke.Color = Color3.fromRGB(255, 100, 255)
+	statusStroke.Thickness = mobile and 2 or 4
+	statusStroke.Parent = statusFrame
+
+	local timeLabel = Instance.new("TextLabel", statusFrame)
+	timeLabel.Position = UDim2.new(0, mobile and 15 or 30, 0, 0)
+	timeLabel.Size = UDim2.new(0.5, mobile and -20 or 0, 1, 0)
+	timeLabel.BackgroundTransparency = 1
+	timeLabel.Font = Enum.Font.GothamBlack
+	timeLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	timeLabel.TextScaled = true
+    timeLabel.TextSize = mobile and 20 or 36
+	timeLabel.Text = "⏱️ 00:00"
+	timeLabel.TextXAlignment = Enum.TextXAlignment.Left
+	timeLabel.TextYAlignment = Enum.TextYAlignment.Center
+	timeLabel.TextStrokeTransparency = 0.5
+	timeLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+
+	local statusLabel = Instance.new("TextLabel", statusFrame)
+	statusLabel.Position = UDim2.new(0.5, 0, 0, 0)
+	statusLabel.Size = UDim2.new(0.5, mobile and -15 or -30, 1, 0)
+	statusLabel.BackgroundTransparency = 1
+	statusLabel.Font = Enum.Font.GothamBlack
+	statusLabel.TextColor3 = Color3.fromRGB(0, 255, 127)
+    statusLabel.TextScaled = true
+	statusLabel.TextSize = mobile and 20 or 36
+	statusLabel.Text = "🟢 ACTIVE"
+	statusLabel.TextXAlignment = Enum.TextXAlignment.Right
+	statusLabel.TextYAlignment = Enum.TextYAlignment.Center
+	statusLabel.TextStrokeTransparency = 0.5
+	statusLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+
+	-- Control Buttons Container
+	local controlsFrame = Instance.new("Frame", mainFrame)
+    local statusBottom = itemsBottom + (mobile and 60 or 100) + padding*2
+    
+	controlsFrame.Position = UDim2.new(0, padding, 0, statusBottom + padding)
+	controlsFrame.Size = UDim2.new(1, -padding*2, 0, mobile and 80 or 120)
+	controlsFrame.BackgroundTransparency = 1
+
+	local controlsLayout = Instance.new("UIListLayout", controlsFrame)
+    if mobile then
+        -- มือถือ: เรียงแนวตั้ง
+        controlsLayout.FillDirection = Enum.FillDirection.Vertical
+        controlsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        controlsLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+        controlsLayout.Padding = UDim.new(0, 10)
+    else
+        -- เดสก์ท็อป: เรียงแนวนอน
+        controlsLayout.FillDirection = Enum.FillDirection.Horizontal
+        controlsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        controlsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+        controlsLayout.Padding = UDim.new(0, 30)
+    end
+
+	-- Stop/Start Button
+	local toggleButton = Instance.new("TextButton", controlsFrame)
+    if mobile then
+        toggleButton.Size = UDim2.new(0.8, 0, 0, 35)
+    else
+        toggleButton.Size = UDim2.new(0, 300, 0, 80)
+    end
+	toggleButton.BackgroundColor3 = Color3.fromRGB(0, 200, 150)
+	toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	toggleButton.Font = Enum.Font.GothamSemibold
+    toggleButton.TextScaled = true
+	toggleButton.TextSize = mobile and 18 or 24
+	toggleButton.BorderSizePixel = 0
+	toggleButton.Text = "⏸️ STOP"
+	toggleButton.AutoButtonColor = true
+
+	local toggleCorner = Instance.new("UICorner")
+	toggleCorner.CornerRadius = UDim.new(0, mobile and 15 or 20)
+	toggleCorner.Parent = toggleButton
+
+	local toggleStroke = Instance.new("UIStroke")
+	toggleStroke.Color = Color3.fromRGB(255, 255, 255)
+	toggleStroke.Thickness = mobile and 2 or 3
+	toggleStroke.Parent = toggleButton
+
+	-- 3D Render Button
+	local renderButton = Instance.new("TextButton", controlsFrame)
+    if mobile then
+        renderButton.Size = UDim2.new(0.8, 0, 0, 35)
+    else
+        renderButton.Size = UDim2.new(0, 300, 0, 80)
+    end
+	renderButton.BackgroundColor3 = Color3.fromRGB(85, 170, 255)
+	renderButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	renderButton.Font = Enum.Font.GothamSemibold
+    renderButton.TextScaled = true
+	renderButton.TextSize = mobile and 18 or 24
+	renderButton.BorderSizePixel = 0
+	renderButton.Text = "🎨 3D OFF"
+	renderButton.AutoButtonColor = true
+
+	local renderCorner = Instance.new("UICorner")
+	renderCorner.CornerRadius = UDim.new(0, mobile and 15 or 20)
+	renderCorner.Parent = renderButton
+
+	local renderStroke = Instance.new("UIStroke")
+	renderStroke.Color = Color3.fromRGB(255, 255, 255)
+	renderStroke.Thickness = mobile and 2 or 3
+	renderStroke.Parent = renderButton
+
+	-- Minimize Button
+	local minimizeButton = Instance.new("TextButton", titleBar)
+    if mobile then
+        minimizeButton.Size = UDim2.new(0, 80, 0, 35)
+        minimizeButton.Position = UDim2.new(1, -90, 0.5, -17.5)
+    else
+        minimizeButton.Size = UDim2.new(0, 100, 0, 50)
+        minimizeButton.Position = UDim2.new(0.75, 0, 0.5, -25)
+    end
+	minimizeButton.BackgroundColor3 = Color3.fromRGB(120, 120, 120)
+	minimizeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	minimizeButton.Font = Enum.Font.Gotham
+	minimizeButton.TextScaled = true
+	minimizeButton.TextSize = mobile and 14 or 16
+	minimizeButton.BorderSizePixel = 0
+	minimizeButton.Text = "HIDE"
+	minimizeButton.AutoButtonColor = true
+
+	local minimizeCorner = Instance.new("UICorner")
+	minimizeCorner.CornerRadius = UDim.new(0, mobile and 8 or 10)
+	minimizeCorner.Parent = minimizeButton
+
+	local minimizeStroke = Instance.new("UIStroke")
+	minimizeStroke.Color = Color3.fromRGB(200, 200, 200)
+	minimizeStroke.Thickness = 1
+	minimizeStroke.Parent = minimizeButton
+
+	-- Button Functions
+	local guiElements = {coinsFrame, itemsFrame, statusFrame, controlsFrame}
+	local isMinimized = false
+
+	toggleButton.MouseButton1Click:Connect(function()
+		isFarming = not isFarming
+		if isFarming then
+			toggleButton.Text = "⏸️ STOP"
+			toggleButton.BackgroundColor3 = Color3.fromRGB(0, 200, 150)
+			statusLabel.Text = "🟢 ACTIVE"
+			statusLabel.TextColor3 = Color3.fromRGB(0, 255, 127)
+		else
+			toggleButton.Text = "▶️ START"
+			toggleButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+			statusLabel.Text = "🔴 STOPPED"
+			statusLabel.TextColor3 = Color3.fromRGB(255, 85, 85)
+		end
+	end)
+
+	renderButton.MouseButton1Click:Connect(function()
+		setRenderingEnabled(not renderingEnabled)
+		if renderingEnabled then
+			renderButton.Text = "🎨 3D OFF"
+			renderButton.BackgroundColor3 = Color3.fromRGB(85, 170, 255)
+		else
+			renderButton.Text = "🎨 3D ON"
+			renderButton.BackgroundColor3 = Color3.fromRGB(255, 140, 0)
+		end
+	end)
+
+	minimizeButton.MouseButton1Click:Connect(function()
+		isMinimized = not isMinimized
+		for _, element in ipairs(guiElements) do
+			element.Visible = not isMinimized
+		end
+		if isMinimized then
+			mainFrame.Size = UDim2.new(mobile and 0.98 or 0.85, 0, 0, mobile and 70 or 100)
+			minimizeButton.Text = "SHOW"
+			if mobile then
+				minimizeButton.Size = UDim2.new(0, 90, 0, 35)
+				minimizeButton.Position = UDim2.new(1, -100, 0.5, -17.5)
+			else
+				minimizeButton.Size = UDim2.new(0, 120, 0, 50)
+			end
+			minimizeButton.BackgroundColor3 = Color3.fromRGB(85, 170, 85)
+		else
+			if mobile then
+				mainFrame.Size = UDim2.new(0.98, 0, 0.95, 0)
+				minimizeButton.Size = UDim2.new(0, 80, 0, 35)
+				minimizeButton.Position = UDim2.new(1, -90, 0.5, -17.5)
+			else
+				mainFrame.Size = UDim2.new(0.85, 0, 0.9, 0)
+				minimizeButton.Size = UDim2.new(0, 100, 0, 50)
+			end
+			minimizeButton.Text = "HIDE"
+			minimizeButton.BackgroundColor3 = Color3.fromRGB(120, 120, 120)
+		end
+	end)
+
+	-- Make draggable (เฉพาะเดสก์ท็อป)
+	if not mobile then
+		local dragging = false
+		local dragInput, dragStart, startPos
+
+		titleBar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragging = true
+				dragStart = input.Position
+				startPos = mainFrame.Position
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then
+						dragging = false
+					end
+				end)
+			end
+		end)
+
+		titleBar.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseMovement then
+				dragInput = input
+			end
+		end)
+
+		UserInputService.InputChanged:Connect(function(input)
+			if input == dragInput and dragging then
+				local delta = input.Position - dragStart
+				local newPosition = UDim2.new(
+					startPos.X.Scale, startPos.X.Offset + delta.X,
+					startPos.Y.Scale, startPos.Y.Offset + delta.Y
+				)
+				mainFrame.Position = newPosition
+			end
+		end)
+	end
+
+	-- 📱 Responsive: ปรับขนาดเมื่อหน้าจอเปลี่ยน
+	local function updateResponsiveLayout()
+		local newScale = getScreenScale()
+		local newMobile = isMobile()
+		local newViewport = workspace.CurrentCamera.ViewportSize
+		
+		-- อัพเดตขนาดตัวอักษร
+		title.TextSize = newMobile and 28 or 55
+		coinsIcon.TextSize = newMobile and 35 or 60
+		coinsLabel.TextSize = newMobile and 24 or 42
+		
+		-- อัพเดตขนาดองค์ประกอบต่างๆ
+		for itemName, label in pairs(_G.FarmItemLabels) do
+			label.TextSize = newMobile and 24 or 48
+		end
+		
+		print("📱 Layout Updated - Mobile:", newMobile, "Scale:", newScale, "Viewport:", newViewport.X.."x"..newViewport.Y)
+	end
+
+	-- ฟังการเปลี่ยนแปลงขนาดหน้าจอ
+	workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveLayout)
+
+	-- Update loop
+	task.spawn(function()
+		while true do
+			local now = tick()
+			local elapsed = now - farmStartTime
+			timeLabel.Text = string.format("⏱️ %02d:%02d", math.floor(elapsed / 60), math.floor(elapsed % 60))
+
+			-- Update coins
+			pcall(function()
+				local coins = LocalPlayer.Data.Currency.Coins.Value
+				coinsLabel.Text = string.format("COINS: %s", tostring(coins):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+			end)
+
+			-- Update items
+			local res = LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Resources")
+			if res then
+				for _, name in ipairs(watchedItems) do
+					local itemName = name:gsub("FoodModel", "")
+					local val = res:FindFirstChild(itemName)
+					local label = _G.FarmItemLabels[itemName]
+					if label and val then
+						label.Text = tostring(val.Value)
+					end
+				end
+			end
+			task.wait(1)
+		end
+	end)
+end
+
+-- ✅ ฟังก์ชันวาร์ปไปตำแหน่งที่กำหนด
+local function teleportToPosition(pos)
+    local root = Character:FindFirstChild("HumanoidRootPart")
+    if root and pos then
+        root.CFrame = CFrame.new(pos + Vector3.new(0, 5, 0))
+        print("🛫 วาร์ปไปเช็คตำแหน่ง:", pos)
+    end
+end
+
+-- ✅ ฟังก์ชันตรวจว่ามีต้นไม้หรือไม่
+local function findFoodNode()
+    local foodFolder = workspace:FindFirstChild("Interactions")
+        and workspace.Interactions:FindFirstChild("Nodes")
+        and workspace.Interactions.Nodes:FindFirstChild("Food")
+
+    if not foodFolder then return nil end
+
+    for _, node in ipairs(foodFolder:GetChildren()) do
+        if node:IsA("Model") and node.Name == "LargeFoodNode" then
+            local part = node:FindFirstChild("BillboardPart")
+            local health = part and part:FindFirstChild("Health")
+            if part and health and health.Value > 0 then
+                return node, part
+            end
+        end
+    end
+    return nil
+end
+
+-- ✅ ตรวจสอบและขาย
+local function sellEverythingInInventory()
+	local res = LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Resources")
+	if not res then return end
+	local args = {}
+	for _, item in ipairs(res:GetChildren()) do
+		if item:IsA("NumberValue") and item.Value >= 200 then
+			table.insert(args, {
+				ItemName = item.Name,
+				Amount = 10000
+			})
+		end
+	end
+	if #args > 0 then
+		ReplicatedStorage.Remotes.SellItemRemote:FireServer(unpack(args))
+		print("✅ ขายไอเทมทั้งหมดในกระเป๋าแล้ว")
+	end
+end
+
+local function allWatchedItemsReachedTarget()
+	local res = LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Resources")
+	if not res then return false end
+	for _, itemName in ipairs(watchedItems) do
+		local cleanName = itemName:gsub("FoodModel", "")
+		local val = res:FindFirstChild(cleanName)
+		if not val or val.Value < 10000 then
+			return false
+		end
+	end
+	return true
+end
+
+local function checkAndSell()
+	local res = LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Resources")
+	if not res then return end
+	local remoteTeleport = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("WorldTeleportRemote")
+
+	if game.PlaceId == SELL_WORLD_ID then
+		local sold = false
+		for _, itemName in ipairs(watchedItems) do
+			local cleanName = itemName:gsub("FoodModel", "")
+			local val = res:FindFirstChild(cleanName)
+			if val and val.Value >= 50 then
+				ReplicatedStorage.Remotes.SellItemRemote:FireServer({
+					ItemName = cleanName,
+					Amount = 10000
+				})
+				sold = true
+				task.wait(0.2)
+			end
+		end
+		if sold then
+			task.wait(1)
+			print("✅ ขายเสร็จ → วาร์ปกลับโลกฟาร์ม")
+			local args = { FARM_WORLD_ID, {} }
+			remoteTeleport:InvokeServer(unpack(args))
+		end
+	else
+		if allWatchedItemsReachedTarget() then
+			print("🛫 ทุกไอเทมถึง 200 แล้ว → วาร์ปไปโลกขาย")
+			local args = { SELL_WORLD_ID, {} }
+			remoteTeleport:InvokeServer(unpack(args))
+		end
+	end
+end
+
+-- ป้องกันตกโลก
+RunService.Stepped:Connect(function()
+	local hrp = Character:FindFirstChild("HumanoidRootPart")
+	if hrp and hrp.Position.Y < -100 then
+		hrp.CFrame = CFrame.new(lastSafePosition)
+	end
+end)
+
+-- ตรวจทุก 1 วิ
+task.spawn(function()
+	while true do
+		pcall(checkAndSell)
+		task.wait(1)
+	end
+end)
+
+-- Anti-AFK
+task.spawn(function()
+	while true do
+		VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+		VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+		print("🛡️ Anti-AFK: คลิกกันหลุด")
+		task.wait(180)
+	end
+end)
+
+-- ฟาร์ม LargeFoodNode
+local function getRemote(name)
+	for i = 1, 100 do
+		local dragon = Character:FindFirstChild("Dragons") and Character.Dragons:FindFirstChild(tostring(i))
+		if dragon and dragon:FindFirstChild("Remotes") then
+			local remote = dragon.Remotes:FindFirstChild(name)
+			if remote then return remote end
+		end
+	end
+	return nil
+end
+
+local function getHealth(part)
+	return part and part:FindFirstChild("Health")
+end
+
+local function teleportTo(part, offset)
+	local root = Character:FindFirstChild("HumanoidRootPart")
+	if root and part then
+		root.CFrame = CFrame.new(part.Position - Vector3.new(0, offset or 0, 0))
+	end
+end
+
+local function pullItemToPlayer()
+	local root = Character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	for _, source in ipairs({workspace, workspace:FindFirstChild("Camera")}) do
+		for _, name in ipairs(targetNames) do
+			local model = source and source:FindFirstChild(name)
+			if model and model:IsA("Model") and model.PrimaryPart then
+				model:SetPrimaryPartCFrame(CFrame.new(root.Position + Vector3.new(0, 1, 0)))
+			end
+		end
+	end
+end
+
+local function distanceXZ(a, b)
+	local dxz = Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)
+	return dxz.Magnitude
+end
+
+local function attackTarget(part)
+	local remote = getRemote("PlaySoundRemote")
+	if not remote then return end
+
+	local health = getHealth(part)
+	if not health or health.Value <= 0 then return end
+
+	local root = Character:FindFirstChild("HumanoidRootPart")
+	local offset = MAX_UNDERGROUND_OFFSET
+
+	-- วาร์ปเข้าใกล้ต้นไม้
+	if distanceXZ(root.Position, part.Position) > HORIZONTAL_DISTANCE_THRESHOLD then
+		teleportTo(part, TELEPORT_NEAR_TREE_OFFSET)
+		task.wait(0.1)
+	end
+
+	local success = false
+	while offset >= MIN_UNDERGROUND_OFFSET do
+		teleportTo(part, offset)
+		task.wait(0.1)
+
+		local before = health.Value
+		for _ = 1, 3 do
+			remote:FireServer("Breath", "Destructibles", part)
+			task.wait(0.05)
+		end
+
+		if health.Value < before then
+			lastSafePosition = part.Position + Vector3.new(0, 10, 0)
+			success = true
+			break
+		end
+		offset -= 5
+	end
+
+	-- ยิงต่อเนื่องจนกว่า health จะเป็น 0
+	if success then
+		while health.Value > 0 do
+			for _ = 1, 3 do
+				remote:FireServer("Breath", "Destructibles", part)
+			end
+			pullItemToPlayer()
+			task.wait(0.05)
+		end
+	end
+
+	-- จบแล้ววาร์ปกลับขึ้นมาจากใต้ดิน
+	teleportTo(part, MAX_UNDERGROUND_OFFSET)
+end
+
+-- Heartbeat: ฟาร์มหรือวาร์ปหาต้นไม้
+print("[เริ่มฟาร์ม LargeFoodNode]")
+local lastFarmCheck = 0
+
+RunService.Heartbeat:Connect(function(dt)
+    local now = tick()
+    if now - lastFarmCheck >= 1 then
+        lastFarmCheck = now
+        if not isFarming then return end -- ถ้าหยุดฟาร์ม
+
+        -- ลองหาต้นไม้ในจุดปัจจุบัน
+        local node, part = findFoodNode()
+
+        if node and part then
+            -- เจอต้นไม้ → ฟาร์มปกติ
+            print("[ฟาร์ม:", node:GetFullName(), "]")
+            pcall(function() attackTarget(part) end)
+            currentCheckIndex = 1 -- รีเซ็ต index ถ้าเจอต้นไม้
+        else
+            -- ไม่เจอต้นไม้ → วาร์ปไปตำแหน่งถัดไป
+            if currentCheckIndex <= #checkPositions then
+                teleportToPosition(checkPositions[currentCheckIndex])
+                currentCheckIndex = currentCheckIndex + 1
+            else
+                currentCheckIndex = 1 -- วนกลับตำแหน่งแรกใหม่
+            end
+            task.wait(2) -- รอ 2 วิ เพื่อเช็คว่าต้นไม้เกิดไหม
+        end
+    end
+end)
+
+-- UI
+createCombinedUI()
+
+ensureScriptRunning()
